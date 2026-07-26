@@ -431,13 +431,16 @@ class CrossfadeRecordingStream:
                     # Current track ended - should have transitioned already
                     # Start fresh if we somehow got here
                     logger.debug(f'CrossfadeStream: Track ended, starting fresh')
-                    current_decoder = self._create_decoder()
-                    samples_played = 0
-                    in_crossfade = False
-                    continue
+                    logger.warning(f"EOF early: played={samples_played/SAMPLE_RATE:.2f}s "f"expected={track_duration/SAMPLE_RATE:.2f}s")
+                    if not in_crossfade:
+                        next_decoder = self._create_decoder()
+                        next_buffer = np.empty(0, dtype=np.float32)
+                        in_crossfade = True
+                        crossfade_position = 0
+                        continue
             
             # Check if we should start crossfade
-            if not in_crossfade and samples_played >= crossfade_start:
+            if not in_crossfade and (samples_played >= crossfade_start or samples_played + len(buffer) >= crossfade_start):
                 logger.info(f'CrossfadeStream: Starting crossfade at sample {samples_played}')
                 in_crossfade = True
                 crossfade_position = 0
