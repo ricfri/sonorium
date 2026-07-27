@@ -184,7 +184,7 @@ SPARSE_MAX_INTERVAL = 1800.0  # 30 minutes at ~0% presence
 SPARSE_INTERVAL_VARIANCE = 0.30
 
 # Crossfade duration in seconds for loop transitions
-LOOP_CROSSFADE_DURATION = 1.5
+LOOP_CROSSFADE_DURATION = 6.0
 # Fade duration for tracks fading in/out of the mix
 TRACK_FADE_DURATION = 6.0
 # Sample rate
