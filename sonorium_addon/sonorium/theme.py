@@ -125,7 +125,12 @@ class ThemeStream:
         out_buffer = np.empty((1, chunk_size), dtype=np.int16)
 
         while True:
-            data_recs = [next(streams) for streams in self.recording_streams if streams.instance.is_enabled]
+            data_recs = []
+            for stream in self.recording_streams:
+                inst = getattr(stream, 'instance', None)
+                if inst is None or getattr(inst, 'is_enabled', True):
+                    data_recs.append(next(stream))
+
             if not data_recs:
                 # logger.debug(f'Theme "{self.theme_def.name}" has no enabled recordings. Streaming silence...')
                 data_recs.append(self.chunk_silence)
