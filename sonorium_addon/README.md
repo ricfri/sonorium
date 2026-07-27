@@ -8,7 +8,7 @@
 
 Sonorium lets you create immersive ambient audio environments throughout your home. Stream richly layered soundscapes—from distant thunder and rainfall to forest ambiance and ocean waves—to any combination of media players in your Home Assistant setup.
 
-## What's New in v1.2.83
+## What's New in v1.2.831111
 
 ### Plugin Browser & Catalog
 
@@ -95,21 +95,25 @@ Ambient soundscapes aren't just background noise—they're a powerful tool for m
 ## Screenshots
 
 ### Channels View
+
 Create and manage multiple audio channels, each streaming to different speakers.
 
 ![Channels](https://raw.githubusercontent.com/synssins/sonorium/main/screenshots/Channels.png)
 
 ### Theme Selection
+
 Choose from your library of ambient themes for each channel.
 
 ![Theme Selection](https://raw.githubusercontent.com/synssins/sonorium/main/screenshots/Channels_Theme_Selection.png)
 
 ### Themes Library
+
 Organize your audio files into themes with favorites and categories.
 
 ![Themes](https://raw.githubusercontent.com/synssins/sonorium/main/screenshots/Themes.png)
 
 ### Settings
+
 Configure speakers, volume defaults, and other preferences.
 
 ![Settings](https://raw.githubusercontent.com/synssins/sonorium/main/screenshots/Settings.png)
@@ -117,12 +121,14 @@ Configure speakers, volume defaults, and other preferences.
 ## Features
 
 ### Multi-Zone Audio
+
 - **Multiple Channels**: Run up to 10 independent audio channels simultaneously (configurable)
 - **Per-Channel Themes**: Each channel plays its own theme
 - **Flexible Speaker Selection**: Target individual speakers, entire rooms, floors, or custom speaker groups
 - **Live Speaker Management**: Add or remove speakers from active channels without interrupting playback
 
 ### Theme System
+
 - **Theme-Based Organization**: Audio files organized into theme folders (Thunder, Forest, Ocean, etc.)
 - **Automatic Mixing**: All recordings in a theme blend together seamlessly
 - **Theme Favorites**: Star your most-used themes for quick access
@@ -130,12 +136,14 @@ Configure speakers, volume defaults, and other preferences.
 - **Theme Icons**: Visual icons for easy theme identification
 
 ### Playback Control
+
 - **Per-Channel Volume**: Independent volume control for each channel
 - **Master Gain**: Global output level control
 - **Crossfade Looping**: Seamless loops with equal-power crossfades
 - **Play/Pause/Stop**: Full transport controls per channel
 
 ### Track Mixer
+
 Fine-tune how each audio file plays within a theme:
 
 - **Presence Control** - Set how often each track appears in the mix (0-100%). Low presence tracks fade in and out naturally rather than playing constantly.
@@ -147,12 +155,14 @@ Fine-tune how each audio file plays within a theme:
   - **Presence** - Fade in/out based on presence setting
 
 ### Home Assistant Dashboard Integration
+
 - **MQTT Entities** - Full dashboard control via MQTT (session select, theme/preset dropdowns, play/stop, volume)
 - **Human-Readable Names** - Theme and preset dropdowns show names instead of UUIDs
 - **Status Sensors** - See playback status and assigned speakers from your dashboard
 - **Automation Support** - Use HA automations to trigger soundscapes (morning alarms, schedules, etc.)
 
 ### Modern Web Interface
+
 - **Responsive Design**: Works on desktop and mobile
 - **Dark Theme**: Easy on the eyes
 - **Real-Time Status**: See what's playing across all channels
@@ -160,6 +170,7 @@ Fine-tune how each audio file plays within a theme:
 - **Speaker Browser**: Visual hierarchy of floors, areas, and speakers
 
 ### Home Assistant Integration
+
 - **Sidebar Access**: Appears in your HA sidebar for quick access
 - **Ingress Support**: Secure access through Home Assistant's authentication
 - **Media Player Discovery**: Automatically finds all media_player entities
@@ -202,15 +213,16 @@ All theme management is done through the Sonorium web interface:
 
 ### Addon Settings
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `sonorium__stream_url` | `auto` | Base URL for streams (auto-detects HA IP) |
-| `sonorium__path_audio` | `/media/sonorium` | Path to theme folders |
-| `sonorium__max_channels` | `6` | Maximum concurrent channels (1-10) |
+| Setting                  | Default           | Description                               |
+| ------------------------ | ----------------- | ----------------------------------------- |
+| `sonorium__stream_url`   | `auto`            | Base URL for streams (auto-detects HA IP) |
+| `sonorium__path_audio`   | `/media/sonorium` | Path to theme folders                     |
+| `sonorium__max_channels` | `6`               | Maximum concurrent channels (1-10)        |
 
 ### Web UI Settings
 
 Access Settings from the sidebar to configure:
+
 - **Crossfade Duration**: Blend time between loops (0-10 seconds)
 - **Default Volume**: Initial volume for new channels
 - **Master Gain**: Global output level
@@ -221,10 +233,12 @@ Access Settings from the sidebar to configure:
 Sonorium provides a REST API for integration and automation:
 
 ### Streams
+
 - `GET /stream/{theme_id}` - Direct audio stream for a theme
 - `GET /stream/channel{n}` - Audio stream for channel N
 
 ### Channels
+
 - `GET /api/channels` - List all channels
 - `POST /api/sessions` - Create a new channel/session
 - `POST /api/sessions/{id}/play` - Start playback
@@ -232,31 +246,37 @@ Sonorium provides a REST API for integration and automation:
 - `POST /api/sessions/{id}/volume` - Set volume
 
 ### Themes
+
 - `GET /api/themes` - List all themes
 - `POST /api/themes/create` - Create a new theme
 - `POST /api/themes/{id}/upload` - Upload audio file
 
 ### Status
+
 - `GET /api/status` - Current system status
 
 ## Troubleshooting
 
 ### No Sound
+
 - Check that your media player supports HTTP audio streams
 - Verify the stream URL is accessible from your speaker
 - Check the channel volume and master gain aren't set to 0
 
 ### Cast Device Not Playing
+
 - This is usually a network/VLAN issue—v1.2.66 adds HA API fallback to handle this automatically
 - Check addon logs for "Using HA API fallback" message
 - Verify HA can control the Cast device (test volume control)
 
 ### Speakers Not Showing
+
 - Ensure speakers are media_player entities in Home Assistant
 - Check that speakers aren't disabled in Sonorium settings
 - Try refreshing speakers from the Settings page
 
 ### Theme Not Loading
+
 - Verify audio files are in supported formats
 - Check file permissions on `/media/sonorium/`
 - Look for errors in the addon logs
