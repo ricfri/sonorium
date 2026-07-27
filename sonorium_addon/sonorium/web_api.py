@@ -1308,9 +1308,9 @@ def create_app(app_instance: 'SonoriumApp', channel_manager: ChannelManager | No
                 sessions_stopped.append(session_id)
                 logger.info(f'Stopped session "{session.name}" for theme deletion')
 
-        # Clear the theme's streams to release file handles
+        # Close the theme's active streams to release file handles
         if theme.streams:
-            theme.streams.clear()
+            theme.close_all_streams()
 
         # Remove theme from app's themes dictionary to fully release references
         if theme_id in _app_instance.themes:

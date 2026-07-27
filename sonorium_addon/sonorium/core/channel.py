@@ -295,6 +295,20 @@ class Channel:
             except StopIteration:
                 break
 
+        # Close old generator/stream if possible after we no longer need it
+        if old_generator is not None:
+            if hasattr(old_generator, 'close'):
+                try:
+                    old_generator.close()
+                except Exception:
+                    pass
+
+        if self._theme_stream is not None and hasattr(self._theme_stream, 'close'):
+            try:
+                self._theme_stream.close()
+            except Exception:
+                pass
+
         # Switch to new theme
         self._current_theme = theme
         self._theme_stream = new_stream
@@ -307,9 +321,22 @@ class Channel:
         with self._lock:
             logger.info(f"Channel {self.id}: Stopping playback")
             self._generator_running = False
-            self._current_theme = None
-            self._theme_stream = None
+
+            if self._chunk_generator is not None and hasattr(self._chunk_generator, 'close'):
+                try:
+                    self._chunk_generator.close()
+                except Exception:
+                    pass
             self._chunk_generator = None
+
+            if self._theme_stream is not None and hasattr(self._theme_stream, 'close'):
+                try:
+                    self._theme_stream.close()
+                except Exception:
+                    pass
+            self._theme_stream = None
+
+            self._current_theme = None
             self._pending_theme = None
             self._theme_version += 1
             self.state = ChannelState.IDLE

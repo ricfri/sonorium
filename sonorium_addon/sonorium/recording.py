@@ -292,9 +292,29 @@ class BufferedAudioStream:
             for chunk in self.inner_stream:
                 if self._stop_event.is_set():
                     break
-                self.queue.put(chunk.copy())
+                while not self._stop_event.is_set():
+                    try:
+                        self.queue.put(chunk.copy(), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                if self._stop_event.is_set():
+                    break
         except Exception as e:
             logger.error(f"BufferedAudioStream error in producer thread: {e}")
+
+    def close(self):
+        self._stop_event.set()
+        try:
+            if self._worker.is_alive():
+                self._worker.join(timeout=1.0)
+        except Exception:
+            pass
+        if hasattr(self.inner_stream, 'close'):
+            try:
+                self.inner_stream.close()
+            except Exception:
+                pass
 
     @property
     def instance(self):
@@ -431,6 +451,14 @@ class RecordingThemeStream:
     def __next__(self):
         return next(self.gen)
 
+    def close(self):
+        if self.gen is not None:
+            try:
+                self.gen.close()
+            except Exception:
+                pass
+            self.gen = None
+
 
 class CrossfadeRecordingStream:
     """
@@ -532,6 +560,14 @@ class CrossfadeRecordingStream:
 
     def __next__(self):
         return next(self.gen)
+
+    def close(self):
+        if self.gen is not None:
+            try:
+                self.gen.close()
+            except Exception:
+                pass
+            self.gen = None
 
 
 class SparsePlaybackStream:
@@ -681,6 +717,14 @@ class SparsePlaybackStream:
     def __next__(self):
         return next(self.gen)
 
+    def close(self):
+        if self.gen is not None:
+            try:
+                self.gen.close()
+            except Exception:
+                pass
+            self.gen = None
+
 
 class PresenceMixingStream:
     """
@@ -807,3 +851,16 @@ class PresenceMixingStream:
 
     def __next__(self):
         return next(self.gen)
+
+    def close(self):
+        if self.base_stream is not None and hasattr(self.base_stream, 'close'):
+            try:
+                self.base_stream.close()
+            except Exception:
+                pass
+        if self.gen is not None:
+            try:
+                self.gen.close()
+            except Exception:
+                pass
+            self.gen = None

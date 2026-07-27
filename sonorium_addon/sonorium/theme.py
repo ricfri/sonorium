@@ -86,6 +86,14 @@ class ThemeDefinition:
         logger.info(f'ThemeDefinition {self.name}: Created new ThemeStream (total: {len(self.streams)} streams)')
         return theme
 
+    def close_all_streams(self):
+        for stream in list(self.streams):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self.streams.clear()
+
 
 class ThemeStream:
     """
@@ -124,34 +132,57 @@ class ThemeStream:
         mix_buffer = np.empty(chunk_size, dtype=np.float32)
         out_buffer = np.empty((1, chunk_size), dtype=np.int16)
 
-        while True:
-            data_recs = []
+        try:
+            while True:
+                data_recs = []
+                for stream in self.recording_streams:
+                    inst = getattr(stream, 'instance', None)
+                    if inst is None or getattr(inst, 'is_enabled', True):
+                        data_recs.append(next(stream))
+
+                if not data_recs:
+                    # logger.debug(f'Theme "{self.theme_def.name}" has no enabled recordings. Streaming silence...')
+                    data_recs.append(self.chunk_silence)
+
+                mix_buffer.fill(0.0)
+                for data in data_recs:
+                    mix_buffer += data[0].astype(np.float32)
+
+                # Soft clipping / normalization to prevent distortion
+                # Divide by sqrt(n) for a good balance between volume and avoiding clipping
+                n_tracks = len(data_recs)
+                if n_tracks > 1:
+                    mix_buffer /= np.sqrt(n_tracks)
+
+                # Apply output gain boost (use device master_volume if available)
+                output_gain = getattr(self.theme_def.sonorium, 'master_volume', DEFAULT_OUTPUT_GAIN)
+                mix_buffer *= output_gain
+
+                np.clip(mix_buffer, -32768, 32767, out=mix_buffer)
+                out_buffer[0, :] = mix_buffer.astype(np.int16)
+                yield out_buffer
+        finally:
             for stream in self.recording_streams:
-                inst = getattr(stream, 'instance', None)
-                if inst is None or getattr(inst, 'is_enabled', True):
-                    data_recs.append(next(stream))
+                if hasattr(stream, 'close'):
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+            self.recording_streams.clear()
 
-            if not data_recs:
-                # logger.debug(f'Theme "{self.theme_def.name}" has no enabled recordings. Streaming silence...')
-                data_recs.append(self.chunk_silence)
-
-            mix_buffer.fill(0.0)
-            for data in data_recs:
-                mix_buffer += data[0].astype(np.float32)
-
-            # Soft clipping / normalization to prevent distortion
-            # Divide by sqrt(n) for a good balance between volume and avoiding clipping
-            n_tracks = len(data_recs)
-            if n_tracks > 1:
-                mix_buffer /= np.sqrt(n_tracks)
-
-            # Apply output gain boost (use device master_volume if available)
-            output_gain = getattr(self.theme_def.sonorium, 'master_volume', DEFAULT_OUTPUT_GAIN)
-            mix_buffer *= output_gain
-
-            np.clip(mix_buffer, -32768, 32767, out=mix_buffer)
-            out_buffer[0, :] = mix_buffer.astype(np.int16)
-            yield out_buffer
+    def close(self):
+        for stream in list(self.recording_streams):
+            if hasattr(stream, 'close'):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        self.recording_streams.clear()
+        if self in self.theme_def.streams:
+            try:
+                self.theme_def.streams.remove(self)
+            except ValueError:
+                pass
 
     def __iter__(self):
         output = av.open(file='.mp3', mode="w")
@@ -186,6 +217,13 @@ class ThemeStream:
 
 
         finally:
+            try:
+                output.close()
+            except Exception:
+                pass
             logger.info('Closing transcoder...')
-            iter_chunks.close()
+            try:
+                iter_chunks.close()
+            except Exception:
+                pass
             output.close()
