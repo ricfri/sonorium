@@ -184,7 +184,7 @@ SPARSE_MAX_INTERVAL = 1800.0  # 30 minutes at ~0% presence
 SPARSE_INTERVAL_VARIANCE = 0.30
 
 # Crossfade duration in seconds for loop transitions
-LOOP_CROSSFADE_DURATION = 8
+LOOP_CROSSFADE_DURATION = 1.5
 # Fade duration for tracks fading in/out of the mix
 TRACK_FADE_DURATION = 6.0
 # Sample rate
@@ -595,7 +595,8 @@ class SparsePlaybackStream:
         # Pre-allocate math buffers
         self.mix_buffer = np.empty(self.CHUNK_SIZE, dtype=np.float32)
         self.out_buffer = np.empty((1, self.CHUNK_SIZE), dtype=np.int16)
-        
+
+        # Register exclusive tracks with coordinator
         if self.instance.exclusive and self.exclusion_coordinator is not None:
             self.exclusion_coordinator.register_track(self.instance.name)
 
@@ -609,17 +610,31 @@ class SparsePlaybackStream:
 
         logger.info(f'SparsePlaybackStream: {self.instance.name} - short file ({file_duration_seconds:.1f}s)')
 
+        # Pre-generate fade curves for the short file
+        # Use shorter fade for very short files
         fade_duration = min(TRACK_FADE_DURATION, file_duration_seconds / 3)
         fade_samples = int(fade_duration * SAMPLE_RATE)
         fade_in_curve = np.sin(np.linspace(0, np.pi/2, fade_samples)).astype(np.float32)
         fade_out_curve = np.cos(np.linspace(0, np.pi/2, fade_samples)).astype(np.float32)
 
         def get_silent_interval():
+            """
+            Calculate silence duration based on presence (lower presence = longer silence).
+
+            - presence=1.0 (100%): ~3 min gaps (±30% = 2.1-3.9 min)
+            - presence=0.5 (50%): ~16.5 min gaps (±30% = 11.5-21.5 min)
+            - presence=0.1 (10%): ~27 min gaps (±30% = 18.9-35.1 min)
+            """
+            # Invert presence: low presence = long interval, high presence = short interval
             factor = 1.0 - presence
             base_interval = SPARSE_MIN_INTERVAL + (SPARSE_MAX_INTERVAL - SPARSE_MIN_INTERVAL) * factor
+
+            # Apply randomization (±30% variance)
             variance_min = 1.0 - SPARSE_INTERVAL_VARIANCE
             variance_max = 1.0 + SPARSE_INTERVAL_VARIANCE
             final_interval = base_interval * random.uniform(variance_min, variance_max)
+
+            logger.debug(f'SparsePlaybackStream: {self.instance.name} next interval: {final_interval/60:.1f} min (presence={presence:.0%})')
             return int(final_interval * SAMPLE_RATE)
 
         def is_blocked_exclusive():
@@ -647,10 +662,14 @@ class SparsePlaybackStream:
         first_play = True
 
         while True:
+            # Check for updated presence
             presence = self.instance.presence
 
+            # On first play, delay with a random portion of the interval
+            # This prevents all sparse tracks from playing at stream start
             if first_play:
                 first_play = False
+                # Random initial delay: 0% to 100% of the normal interval
                 initial_delay_samples = int(get_silent_interval() * random.uniform(0.0, 1.0))
                 initial_delay_chunks = initial_delay_samples // self.CHUNK_SIZE
                 if initial_delay_chunks > 0:
@@ -658,7 +677,9 @@ class SparsePlaybackStream:
                         chunk_count += 1
                         yield silence_chunk
 
+            # For exclusive tracks, first check if we're blocked
             if is_blocked_exclusive() or not try_start_exclusive():
+                # Output silence for a while before checking again
                 wait_chunks = get_block_wait_chunks()
                 for _ in range(wait_chunks):
                     chunk_count += 1
@@ -702,10 +723,14 @@ class SparsePlaybackStream:
                     yield self.out_buffer
                     pos += self.CHUNK_SIZE
 
+            # Mark exclusive track as finished playing
             finish_exclusive()
 
+            # Now output silence for the interval
             silent_samples = get_silent_interval()
             silent_chunks = silent_samples // self.CHUNK_SIZE
+
+            logger.debug(f'SparsePlaybackStream: {self.instance.name} entering silence for {silent_samples/SAMPLE_RATE:.1f}s ({silent_chunks} chunks)')
 
             for _ in range(silent_chunks):
                 chunk_count += 1
