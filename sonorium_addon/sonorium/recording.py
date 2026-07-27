@@ -201,7 +201,7 @@ class RecordingMetadata:
     def __init__(self, path):
         self.path = path
         self._duration_samples = None
-        self._cached_audio = None  # ADDED: Cache for sparse playback files
+        self._cached_audio = None  
 
     def get_instance(self, theme=None):
         return RecordingThemeInstance(self, theme=theme)
@@ -210,24 +210,50 @@ class RecordingMetadata:
     def name(self):
         return self.path.stem
     
+    def get_audio_data(self) -> np.ndarray:
+        """Decodes, resamples, and caches the entire audio file into RAM once."""
+        if self._cached_audio is not None:
+            return self._cached_audio
+
+        logger.info(f"Caching audio into RAM for {self.name}...")
+        resampler = av.AudioResampler(format='s16', layout='mono', rate=SAMPLE_RATE)
+        
+        try:
+            container = av.open(self.path)
+            if len(container.streams.audio) == 0:
+                container.close()
+                self._cached_audio = np.zeros(0, dtype=np.float32)
+                return self._cached_audio
+
+            stream = next(iter(container.streams.audio))
+            samples = []
+
+            for frame_orig in container.decode(stream):
+                for frame_resamp in resampler.resample(frame_orig):
+                    data = frame_resamp.to_ndarray()
+                    data = data.mean(axis=0).astype(np.float32)
+                    samples.append(data.flatten())
+
+            container.close()
+
+            if not samples:
+                self._cached_audio = np.zeros(0, dtype=np.float32)
+            else:
+                self._cached_audio = np.concatenate(samples)
+                self._duration_samples = len(self._cached_audio)
+                
+        except Exception as e:
+            logger.error(f"Failed to decode {self.path}: {e}")
+            self._cached_audio = np.zeros(0, dtype=np.float32)
+            
+        return self._cached_audio
+
     @property
     def duration_samples(self):
-        """Get total duration in samples (cached)"""
+        """Get total duration in samples"""
         if self._duration_samples is None:
-            try:
-                container = av.open(self.path)
-                stream = next(iter(container.streams.audio))
-                # duration is in time_base units
-                if stream.duration and stream.time_base:
-                    duration_sec = float(stream.duration * stream.time_base)
-                    self._duration_samples = int(duration_sec * SAMPLE_RATE)
-                else:
-                    # Fallback: decode to count (slower but accurate)
-                    self._duration_samples = self._count_samples()
-                container.close()
-            except Exception as e:
-                logger.warning(f'Could not get duration for {self.path}: {e}')
-                self._duration_samples = SAMPLE_RATE * 60  # Assume 1 minute as fallback
+            # Getting the audio data will automatically set the exact sample count
+            self.get_audio_data()
         return self._duration_samples
 
     @property
@@ -238,18 +264,6 @@ class RecordingMetadata:
     def is_short_file(self, threshold: float = SHORT_FILE_THRESHOLD_SECONDS) -> bool:
         """Check if this is a short audio file that should use sparse playback"""
         return self.duration_seconds < threshold
-    
-    def _count_samples(self):
-        """Fallback: decode entire file to count samples"""
-        container = av.open(self.path)
-        stream = next(iter(container.streams.audio))
-        resampler = av.AudioResampler(format='s16', layout='mono', rate=SAMPLE_RATE)
-        total = 0
-        for frame in container.decode(stream):
-            for resampled in resampler.resample(frame):
-                total += resampled.samples
-        container.close()
-        return total
 
 
 class RecordingThemeInstance:
@@ -312,51 +326,45 @@ class RecordingThemeInstance:
 
 class RecordingThemeStream:
     """
-    Basic recording stream without crossfade - loops with hard cut.
+    Basic recording stream without crossfade - loops with hard cut from RAM cache.
     """
-    CHUNK_SIZE = 1_024
+    CHUNK_SIZE = 4096
 
     def __init__(self, instance: RecordingThemeInstance):
         self.instance = instance
-        self.resampler = av.AudioResampler(format='s16', layout='mono', rate=SAMPLE_RATE)
         self.gen = self._gen()
 
     def _gen(self):
+        audio_data = self.instance.meta.get_audio_data()
+        
+        if len(audio_data) == 0:
+            while True:
+                yield np.zeros((1, self.CHUNK_SIZE), dtype=np.int16)
+                
+        # Pre-apply volume and convert to int16 immediately
+        audio_data = audio_data * self.instance.volume
+        audio_data = np.clip(audio_data, -32768, 32767).astype(np.int16)
+        
+        pos = 0
+        total_samples = len(audio_data)
+        i = 0
+        
         while True:
-            container = av.open(self.instance.meta.path)
-
-            if len(container.streams.audio) == 0:
-                raise ValueError('No audio stream')
-            stream = next(iter(container.streams.audio))
-
-            # FIX: Use a list to accumulate arrays instead of np.hstack
-            buffer_list = []
-            buffer_length = 0
-
-            i = 0
-            for frame_orig in container.decode(stream):
-                for frame_resamp in self.resampler.resample(frame_orig):
-                    data_resamp = frame_resamp.to_ndarray()
-                    data_resamp = data_resamp.mean(axis=0).astype(data_resamp.dtype).reshape(1, -1)
-                    data_resamp = (data_resamp * self.instance.volume).astype(data_resamp.dtype)
-
-                    buffer_list.append(data_resamp)
-                    buffer_length += data_resamp.shape[1]
-
-                    while buffer_length >= self.CHUNK_SIZE:
-                        # Combine only when we have enough data
-                        combined = np.hstack(buffer_list)
-                        
-                        data = combined[:, :self.CHUNK_SIZE]
-                        leftover = combined[:, self.CHUNK_SIZE:]
-                        
-                        buffer_list = [leftover] if leftover.size > 0 else []
-                        buffer_length = leftover.shape[1] if leftover.size > 0 else 0
-
-                        yield data
-                        i += 1
-
-            container.close()
+            chunk_end = pos + self.CHUNK_SIZE
+            
+            if chunk_end <= total_samples:
+                chunk = audio_data[pos:chunk_end]
+                pos += self.CHUNK_SIZE
+            else:
+                # Wrap around the array boundary
+                chunk = np.concatenate([audio_data[pos:], audio_data[:chunk_end - total_samples]])
+                pos = chunk_end - total_samples
+            
+            yield chunk.reshape(1, -1)
+            
+            if i % LOG_THRESHOLD == 0:
+                logger.debug(f'{self.__class__.__name__} Yielding chunk #{i}')
+            i += 1
 
     def __iter__(self):
         return self
@@ -367,141 +375,92 @@ class RecordingThemeStream:
 
 class CrossfadeRecordingStream:
     """
-    Recording stream with crossfade looping - seamlessly blends end of track into beginning.
-    
-    When approaching the end of the current playback, starts a second decoder
-    and crossfades between them using equal-power curves.
+    Recording stream with crossfade looping - seamlessly blends end of track into beginning using RAM cache.
     """
-    CHUNK_SIZE = 1_024
+    CHUNK_SIZE = 4096
 
     def __init__(self, instance: RecordingThemeInstance):
         self.instance = instance
         self.gen = self._gen()
 
-    def _create_decoder(self):
-        """Create a new decoder generator for the audio file"""
-        resampler = av.AudioResampler(format='s16', layout='mono', rate=SAMPLE_RATE)
-        container = av.open(self.instance.meta.path)
-        
-        if len(container.streams.audio) == 0:
-            raise ValueError('No audio stream')
-        stream = next(iter(container.streams.audio))
-        
-        def decode():
-            try:
-                for frame_orig in container.decode(stream):
-                    for frame_resamp in resampler.resample(frame_orig):
-                        data = frame_resamp.to_ndarray()
-                        # Downmix to mono
-                        data = data.mean(axis=0).astype(np.float32)
-                        # Apply instance volume
-                        data = data * self.instance.volume
-                        yield data
-            finally:
-                container.close()
-        
-        return decode()
-
     def _gen(self):
-        """Main generator with crossfade logic"""
-        track_duration = self.instance.meta.duration_samples
-        crossfade_start = max(0, track_duration - CROSSFADE_SAMPLES)
+        audio_data = self.instance.meta.get_audio_data()
+        
+        if len(audio_data) == 0:
+            while True:
+                yield np.zeros((1, self.CHUNK_SIZE), dtype=np.int16)
+        
+        audio_data = audio_data * self.instance.volume
+        track_duration = len(audio_data)
+        
+        # Ensure we don't try to crossfade more samples than the track actually has
+        actual_crossfade_samples = min(CROSSFADE_SAMPLES, track_duration // 2)
+        crossfade_start = track_duration - actual_crossfade_samples
         
         logger.info(f'CrossfadeStream: {self.instance.name} duration={track_duration} samples, crossfade at {crossfade_start}')
         
-        current_decoder = self._create_decoder()
-        next_decoder = None
+        fade_out = np.cos(np.linspace(0, np.pi/2, actual_crossfade_samples)).astype(np.float32)
+        fade_in = np.sin(np.linspace(0, np.pi/2, actual_crossfade_samples)).astype(np.float32)
         
-        buffer = np.empty(0, dtype=np.float32)
-        samples_played = 0
+        pos = 0
         chunk_count = 0
-        in_crossfade = False
-        crossfade_position = 0
-        
-        fade_out = np.cos(np.linspace(0, np.pi/2, CROSSFADE_SAMPLES)).astype(np.float32)
-        fade_in = np.sin(np.linspace(0, np.pi/2, CROSSFADE_SAMPLES)).astype(np.float32)
-        
-        next_buffer = np.empty(0, dtype=np.float32)
         
         while True:
-            # Fill buffer from current decoder
-            while len(buffer) < self.CHUNK_SIZE * 2:
-                try:
-                    chunk = next(current_decoder)
-                    buffer = np.concatenate([buffer, chunk.flatten()])
-                except StopIteration:
-                    # FIX: The track ended early. Stop pulling from current_decoder immediately.
-                    logger.warning(f"CrossfadeStream: EOF early at {samples_played} samples")
-                    
-                    if next_decoder is None:
-                        next_decoder = self._create_decoder()
-                    
-                    # Immediately swap to the new track to prevent infinite loops and stuttering
-                    current_decoder = next_decoder
-                    buffer = np.concatenate([buffer, next_buffer])
-                    next_decoder = None
-                    next_buffer = np.empty(0, dtype=np.float32)
-                    in_crossfade = False
-                    crossfade_position = 0
-                    samples_played = 0 
-                    break # Break the inner while-loop so we can process what we have
+            chunk_end = pos + self.CHUNK_SIZE
             
-            # Check if we should start crossfade
-            if not in_crossfade and (samples_played >= crossfade_start or samples_played + len(buffer) >= crossfade_start):
-                in_crossfade = True
-                crossfade_position = 0
-                next_decoder = self._create_decoder()
-                next_buffer = np.empty(0, dtype=np.float32)
-            
-            # If in crossfade, also fill next_buffer
-            if in_crossfade and next_decoder is not None:
-                while len(next_buffer) < self.CHUNK_SIZE * 2:
-                    try:
-                        chunk = next(next_decoder)
-                        next_buffer = np.concatenate([next_buffer, chunk.flatten()])
-                    except StopIteration:
-                        break
-            
-            # Extract chunk
-            output_chunk = buffer[:self.CHUNK_SIZE].copy()
-            buffer = buffer[self.CHUNK_SIZE:]
-            
-            # Apply crossfade if active
-            if in_crossfade and len(next_buffer) >= self.CHUNK_SIZE:
-                next_chunk = next_buffer[:self.CHUNK_SIZE].copy()
-                next_buffer = next_buffer[self.CHUNK_SIZE:]
+            # Case 1: Entire chunk is before the crossfade
+            if chunk_end <= crossfade_start:
+                output = audio_data[pos:chunk_end]
+                pos += self.CHUNK_SIZE
                 
-                fade_start = crossfade_position
-                fade_end = min(crossfade_position + self.CHUNK_SIZE, CROSSFADE_SAMPLES)
-                chunk_fade_len = fade_end - fade_start
+            # Case 2: Entire chunk is inside the crossfade
+            elif pos >= crossfade_start:
+                fade_start_idx = pos - crossfade_start
+                fade_end_idx = fade_start_idx + self.CHUNK_SIZE
                 
-                if chunk_fade_len > 0 and fade_start < CROSSFADE_SAMPLES:
-                    fade_out_chunk = fade_out[fade_start:fade_end]
-                    fade_in_chunk = fade_in[fade_start:fade_end]
+                if fade_end_idx <= actual_crossfade_samples:
+                    out_part = audio_data[pos:pos+self.CHUNK_SIZE] * fade_out[fade_start_idx:fade_end_idx]
+                    in_part = audio_data[fade_start_idx:fade_end_idx] * fade_in[fade_start_idx:fade_end_idx]
+                    output = out_part + in_part
                     
-                    if len(fade_out_chunk) < self.CHUNK_SIZE:
-                        fade_out_chunk = np.concatenate([fade_out_chunk, np.zeros(self.CHUNK_SIZE - len(fade_out_chunk), dtype=np.float32)])
-                        fade_in_chunk = np.concatenate([fade_in_chunk, np.ones(self.CHUNK_SIZE - len(fade_in_chunk), dtype=np.float32)])
+                    pos += self.CHUNK_SIZE
+                    if pos >= track_duration:
+                        pos = actual_crossfade_samples
+                else:
+                    # Chunk splits exactly across the end of the file
+                    rem_samples = track_duration - pos
                     
-                    output_chunk = output_chunk[:len(fade_out_chunk)] * fade_out_chunk + next_chunk[:len(fade_in_chunk)] * fade_in_chunk
+                    out_part = audio_data[pos:track_duration] * fade_out[fade_start_idx:actual_crossfade_samples]
+                    in_part = audio_data[fade_start_idx:actual_crossfade_samples] * fade_in[fade_start_idx:actual_crossfade_samples]
+                    first_half = out_part + in_part
+                    
+                    pos = actual_crossfade_samples
+                    remaining_chunk = self.CHUNK_SIZE - rem_samples
+                    second_half = audio_data[pos:pos+remaining_chunk]
+                    pos += remaining_chunk
+                    
+                    output = np.concatenate([first_half, second_half])
+                    
+            # Case 3: Chunk starts normal, but ends inside the crossfade
+            else:
+                normal_samples = crossfade_start - pos
+                fade_samples = self.CHUNK_SIZE - normal_samples
                 
-                crossfade_position += self.CHUNK_SIZE
+                first_half = audio_data[pos:crossfade_start]
                 
-                if crossfade_position >= CROSSFADE_SAMPLES:
-                    current_decoder = next_decoder
-                    buffer = next_buffer
-                    next_decoder = None
-                    next_buffer = np.empty(0, dtype=np.float32)
-                    samples_played = crossfade_position  
-                    in_crossfade = False
-                    crossfade_position = 0
+                out_part = audio_data[crossfade_start:crossfade_start+fade_samples] * fade_out[:fade_samples]
+                in_part = audio_data[:fade_samples] * fade_in[:fade_samples]
+                second_half = out_part + in_part
+                
+                output = np.concatenate([first_half, second_half])
+                pos += self.CHUNK_SIZE
+
+            output_data = np.clip(output, -32768, 32767).astype(np.int16).reshape(1, -1)
             
-            output_chunk = np.clip(output_chunk, -32768, 32767).astype(np.int16)
-            output_data = output_chunk.reshape(1, -1)
-            
-            samples_played += self.CHUNK_SIZE
             chunk_count += 1
-            
+            if chunk_count % LOG_THRESHOLD == 0:
+                logger.debug(f'CrossfadeStream: chunk #{chunk_count}, samples={pos}')
+                
             yield output_data
 
     def __iter__(self):
@@ -528,13 +487,12 @@ class SparsePlaybackStream:
     provided, only one exclusive track can play at a time. Other exclusive
     tracks output silence until the playing track finishes.
     """
-    CHUNK_SIZE = 1_024
+    CHUNK_SIZE = 4096
 
     def __init__(self, instance: RecordingThemeInstance, exclusion_coordinator: ExclusionGroupCoordinator = None):
         self.instance = instance
         self.exclusion_coordinator = exclusion_coordinator
 
-        # Register exclusive tracks with coordinator
         if self.instance.exclusive and self.exclusion_coordinator is not None:
             self.exclusion_coordinator.register_track(self.instance.name)
 
@@ -544,101 +502,44 @@ class SparsePlaybackStream:
         import random
 
         presence = self.instance.presence
-        file_duration_samples = self.instance.meta.duration_samples
         file_duration_seconds = self.instance.meta.duration_seconds
 
         logger.info(f'SparsePlaybackStream: {self.instance.name} - short file ({file_duration_seconds:.1f}s), using sparse playback' +
                     (', exclusive=True' if self.instance.exclusive else ''))
 
-        # Pre-generate fade curves for the short file
-        # Use shorter fade for very short files
         fade_duration = min(TRACK_FADE_DURATION, file_duration_seconds / 3)
         fade_samples = int(fade_duration * SAMPLE_RATE)
         fade_in_curve = np.sin(np.linspace(0, np.pi/2, fade_samples)).astype(np.float32)
         fade_out_curve = np.cos(np.linspace(0, np.pi/2, fade_samples)).astype(np.float32)
 
         def get_silent_interval():
-            """
-            Calculate silence duration based on presence (lower presence = longer silence).
-
-            - presence=1.0 (100%): ~3 min gaps (±30% = 2.1-3.9 min)
-            - presence=0.5 (50%): ~16.5 min gaps (±30% = 11.5-21.5 min)
-            - presence=0.1 (10%): ~27 min gaps (±30% = 18.9-35.1 min)
-            """
-            # Invert presence: low presence = long interval, high presence = short interval
             factor = 1.0 - presence
             base_interval = SPARSE_MIN_INTERVAL + (SPARSE_MAX_INTERVAL - SPARSE_MIN_INTERVAL) * factor
-
-            # Apply randomization (±30% variance)
             variance_min = 1.0 - SPARSE_INTERVAL_VARIANCE
             variance_max = 1.0 + SPARSE_INTERVAL_VARIANCE
-            variation = random.uniform(variance_min, variance_max)
-            final_interval = base_interval * variation
-
-            logger.debug(f'SparsePlaybackStream: {self.instance.name} next interval: {final_interval/60:.1f} min (presence={presence:.0%})')
+            final_interval = base_interval * random.uniform(variance_min, variance_max)
             return int(final_interval * SAMPLE_RATE)
 
-        def decode_file_once():
-            """Decode the entire file once, returning samples. Caches the result to save CPU."""
-            # FIX: Check if we've already decoded this file
-            if hasattr(self.instance.meta, '_cached_audio') and self.instance.meta._cached_audio is not None:
-                return self.instance.meta._cached_audio
-
-            resampler = av.AudioResampler(format='s16', layout='mono', rate=SAMPLE_RATE)
-            container = av.open(self.instance.meta.path)
-
-            if len(container.streams.audio) == 0:
-                container.close()
-                return np.zeros(0, dtype=np.float32)
-
-            stream = next(iter(container.streams.audio))
-            samples = []
-
-            for frame_orig in container.decode(stream):
-                for frame_resamp in resampler.resample(frame_orig):
-                    data = frame_resamp.to_ndarray()
-                    data = data.mean(axis=0).astype(np.float32)
-                    samples.append(data.flatten())
-
-            container.close()
-
-            if not samples:
-                return np.zeros(0, dtype=np.float32)
-
-            final_audio = np.concatenate(samples)
-            # FIX: Cache the result for next time
-            self.instance.meta._cached_audio = final_audio
-            return final_audio
-
         def is_blocked_exclusive():
-            """Check if this exclusive track is blocked (without claiming playback)."""
             if not self.instance.exclusive or self.exclusion_coordinator is None:
                 return False
             return self.exclusion_coordinator.is_blocked(self.instance.name)
 
         def try_start_exclusive():
-            """Try to claim exclusive playback slot. Returns True if allowed."""
             if not self.instance.exclusive or self.exclusion_coordinator is None:
                 return True
-            return self.exclusion_coordinator.try_start_playing(
-                self.instance.name,
-                file_duration_seconds
-            )
+            return self.exclusion_coordinator.try_start_playing(self.instance.name, file_duration_seconds)
 
         def finish_exclusive():
-            """Mark that this exclusive track has finished."""
             if self.instance.exclusive and self.exclusion_coordinator is not None:
                 self.exclusion_coordinator.finish_playing(self.instance.name)
 
         def get_block_wait_chunks():
-            """Get number of chunks to wait when blocked (randomized to prevent races)."""
             if self.exclusion_coordinator is not None:
                 wait_time = self.exclusion_coordinator.get_wait_time()
                 if wait_time > 0:
-                    # Add some randomization to prevent all tracks trying at once
                     wait_time += random.uniform(0.5, 3.0)
                     return int(wait_time * SAMPLE_RATE / self.CHUNK_SIZE)
-            # Default: wait 1-3 seconds before retrying
             return int(random.uniform(1.0, 3.0) * SAMPLE_RATE / self.CHUNK_SIZE)
 
         chunk_count = 0
@@ -646,83 +547,60 @@ class SparsePlaybackStream:
         first_play = True
 
         while True:
-            # Check for updated presence
             presence = self.instance.presence
 
-            # On first play, delay with a random portion of the interval
-            # This prevents all sparse tracks from playing at stream start
             if first_play:
                 first_play = False
-                # Random initial delay: 0% to 100% of the normal interval
                 initial_delay_samples = int(get_silent_interval() * random.uniform(0.0, 1.0))
                 initial_delay_chunks = initial_delay_samples // self.CHUNK_SIZE
                 if initial_delay_chunks > 0:
-                    logger.debug(f'SparsePlaybackStream: {self.instance.name} initial delay: {initial_delay_samples/SAMPLE_RATE:.1f}s')
                     for _ in range(initial_delay_chunks):
                         chunk_count += 1
                         yield silence_chunk
 
-            # For exclusive tracks, first check if we're blocked
             if is_blocked_exclusive():
-                # Output silence for a while before checking again
                 wait_chunks = get_block_wait_chunks()
                 for _ in range(wait_chunks):
                     chunk_count += 1
                     yield silence_chunk
                 continue
 
-            # Try to claim the exclusive playback slot
             if not try_start_exclusive():
-                # Another track claimed it first - wait and retry
                 wait_chunks = get_block_wait_chunks()
                 for _ in range(wait_chunks):
                     chunk_count += 1
                     yield silence_chunk
                 continue
 
-            # Decode and play the file once with fade in/out
-            audio_data = decode_file_once()
+            # Fetch the decoded audio from the RAM cache
+            audio_data = self.instance.meta.get_audio_data().copy()
 
             if len(audio_data) > 0:
-                # Apply volume
                 audio_data = audio_data * self.instance.volume
 
-                # Apply fade in at start
                 if len(fade_in_curve) <= len(audio_data):
                     audio_data[:len(fade_in_curve)] *= fade_in_curve
 
-                # Apply fade out at end
                 if len(fade_out_curve) <= len(audio_data):
                     audio_data[-len(fade_out_curve):] *= fade_out_curve
 
-                # Yield the audio in chunks
                 pos = 0
                 while pos < len(audio_data):
                     chunk_end = min(pos + self.CHUNK_SIZE, len(audio_data))
                     chunk = audio_data[pos:chunk_end]
 
-                    # Pad if needed
                     if len(chunk) < self.CHUNK_SIZE:
                         chunk = np.concatenate([chunk, np.zeros(self.CHUNK_SIZE - len(chunk), dtype=np.float32)])
 
-                    # Convert to int16
                     output = np.clip(chunk, -32768, 32767).astype(np.int16).reshape(1, -1)
-
                     chunk_count += 1
-                    if chunk_count % LOG_THRESHOLD == 0:
-                        logger.debug(f'SparsePlaybackStream: {self.instance.name} playing chunk #{chunk_count}')
-
                     yield output
                     pos += self.CHUNK_SIZE
 
-            # Mark exclusive track as finished playing
             finish_exclusive()
 
-            # Now output silence for the interval
             silent_samples = get_silent_interval()
             silent_chunks = silent_samples // self.CHUNK_SIZE
-
-            logger.debug(f'SparsePlaybackStream: {self.instance.name} entering silence for {silent_samples/SAMPLE_RATE:.1f}s ({silent_chunks} chunks)')
 
             for _ in range(silent_chunks):
                 chunk_count += 1
@@ -747,7 +625,7 @@ class PresenceMixingStream:
 
     Uses randomized timing so tracks don't all fade in/out together.
     """
-    CHUNK_SIZE = 1_024
+    CHUNK_SIZE = 4096
 
     def __init__(self, base_stream, instance: RecordingThemeInstance):
         self.base_stream = base_stream
@@ -755,41 +633,30 @@ class PresenceMixingStream:
         self.gen = self._gen()
 
     def _gen(self):
-        """Generator that applies presence-based fading"""
         import random
 
-        # State for presence fading
-        is_active = True  # Start active
+        is_active = True  
         current_gain = 1.0 if self.instance.presence >= 1.0 else 0.0
         target_gain = 1.0 if self.instance.presence >= 1.0 else 0.0
         fade_position = 0
         samples_until_change = 0
 
-        # Timing parameters (in samples)
-        min_active_duration = int(30 * SAMPLE_RATE)  # Min 30 seconds active
-        max_active_duration = int(120 * SAMPLE_RATE)  # Max 2 minutes active
-        min_inactive_duration = int(20 * SAMPLE_RATE)  # Min 20 seconds inactive
-        max_inactive_duration = int(90 * SAMPLE_RATE)  # Max 90 seconds inactive
+        min_active_duration = int(30 * SAMPLE_RATE)  
+        max_active_duration = int(120 * SAMPLE_RATE)  
+        min_inactive_duration = int(20 * SAMPLE_RATE)  
+        max_inactive_duration = int(90 * SAMPLE_RATE)  
 
         def get_next_duration(presence, is_active):
-            """Calculate how long to stay in current state based on presence"""
-            if presence >= 1.0:
-                return float('inf')  # Always active
-            if presence <= 0.0:
-                return float('inf')  # Always inactive
+            if presence >= 1.0: return float('inf')  
+            if presence <= 0.0: return float('inf')  
 
             if is_active:
-                # Higher presence = longer active periods
                 base_duration = min_active_duration + (max_active_duration - min_active_duration) * presence
-                variation = random.uniform(0.7, 1.3)
-                return int(base_duration * variation)
+                return int(base_duration * random.uniform(0.7, 1.3))
             else:
-                # Higher presence = shorter inactive periods
                 base_duration = max_inactive_duration - (max_inactive_duration - min_inactive_duration) * presence
-                variation = random.uniform(0.7, 1.3)
-                return int(base_duration * variation)
+                return int(base_duration * random.uniform(0.7, 1.3))
 
-        # Initialize timing
         presence = self.instance.presence
         if presence >= 1.0:
             is_active = True
@@ -800,27 +667,22 @@ class PresenceMixingStream:
             current_gain = 0.0
             target_gain = 0.0
         else:
-            # Start randomly based on presence
             is_active = random.random() < presence
             current_gain = 1.0 if is_active else 0.0
             target_gain = current_gain
 
         samples_until_change = get_next_duration(presence, is_active)
-
         chunk_count = 0
 
         while True:
-            # Get base audio chunk
             try:
                 chunk = next(self.base_stream)
             except StopIteration:
                 return
 
-            # Check for presence value changes
             new_presence = self.instance.presence
             if new_presence != presence:
                 presence = new_presence
-                # Recalculate state for new presence
                 if presence >= 1.0 and target_gain < 1.0:
                     target_gain = 1.0
                     fade_position = 0
@@ -828,41 +690,35 @@ class PresenceMixingStream:
                     target_gain = 0.0
                     fade_position = 0
 
-            # Check if it's time to change state
             samples_until_change -= self.CHUNK_SIZE
             if samples_until_change <= 0 and 0 < presence < 1.0:
                 is_active = not is_active
                 target_gain = 1.0 if is_active else 0.0
                 fade_position = 0
                 samples_until_change = get_next_duration(presence, is_active)
-                if chunk_count % LOG_THRESHOLD == 0:
-                    logger.debug(f'PresenceMixingStream: {self.instance.name} {"fading in" if is_active else "fading out"}')
 
-            # Apply fade if current_gain != target_gain
             if current_gain != target_gain:
-                # Calculate fade progress
-                fade_progress = fade_position / TRACK_FADE_SAMPLES
-                fade_progress = min(1.0, fade_progress)
-
+                fade_progress = min(1.0, fade_position / TRACK_FADE_SAMPLES)
+                
                 if target_gain > current_gain:
-                    # Fading in - equal power curve
                     applied_gain = np.sin(fade_progress * np.pi / 2)
                 else:
-                    # Fading out - equal power curve
                     applied_gain = np.cos(fade_progress * np.pi / 2)
 
                 fade_position += self.CHUNK_SIZE
 
-                # Check if fade complete
                 if fade_progress >= 1.0:
                     current_gain = target_gain
                     applied_gain = target_gain
             else:
                 applied_gain = current_gain
 
-            # Apply gain to chunk
-            if applied_gain < 1.0:
-                # Convert to float, apply gain, convert back
+            # Apply gain efficiently
+            if applied_gain == 1.0:
+                pass  # Skip heavy math, yield as is
+            elif applied_gain == 0.0:
+                chunk = np.zeros_like(chunk)  # Instant silence
+            else:
                 chunk_float = chunk.astype(np.float32) * applied_gain
                 chunk = np.clip(chunk_float, -32768, 32767).astype(np.int16)
 
