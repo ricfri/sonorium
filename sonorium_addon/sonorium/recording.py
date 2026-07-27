@@ -201,6 +201,7 @@ class RecordingMetadata:
     def __init__(self, path):
         self.path = path
         self._duration_samples = None
+        self._cached_audio = None  # ADDED: Cache for sparse playback files
 
     def get_instance(self, theme=None):
         return RecordingThemeInstance(self, theme=theme)
@@ -328,26 +329,31 @@ class RecordingThemeStream:
                 raise ValueError('No audio stream')
             stream = next(iter(container.streams.audio))
 
-            buffer = np.empty((1, 0), dtype=np.int16)
+            # FIX: Use a list to accumulate arrays instead of np.hstack
+            buffer_list = []
+            buffer_length = 0
 
             i = 0
             for frame_orig in container.decode(stream):
                 for frame_resamp in self.resampler.resample(frame_orig):
                     data_resamp = frame_resamp.to_ndarray()
-                    data_resamp = data_resamp.mean(axis=0).astype(data_resamp.dtype).reshape(data_resamp.shape)
+                    data_resamp = data_resamp.mean(axis=0).astype(data_resamp.dtype).reshape(1, -1)
                     data_resamp = (data_resamp * self.instance.volume).astype(data_resamp.dtype)
 
-                    buffer = np.hstack((buffer, data_resamp))
+                    buffer_list.append(data_resamp)
+                    buffer_length += data_resamp.shape[1]
 
-                    while buffer.shape[1] >= self.CHUNK_SIZE:
-                        data = buffer[:, :self.CHUNK_SIZE]
-                        buffer = buffer[:, self.CHUNK_SIZE:]
+                    while buffer_length >= self.CHUNK_SIZE:
+                        # Combine only when we have enough data
+                        combined = np.hstack(buffer_list)
+                        
+                        data = combined[:, :self.CHUNK_SIZE]
+                        leftover = combined[:, self.CHUNK_SIZE:]
+                        
+                        buffer_list = [leftover] if leftover.size > 0 else []
+                        buffer_length = leftover.shape[1] if leftover.size > 0 else 0
 
                         yield data
-
-                        if i % LOG_THRESHOLD == 0:
-                            vol_mean = round(abs(data).mean())
-                            logger.info(f'{self.__class__.__name__} Yielding chunk #{i} {data.shape=}, {buffer.shape=}, {vol_mean=}')
                         i += 1
 
             container.close()
@@ -398,14 +404,11 @@ class CrossfadeRecordingStream:
 
     def _gen(self):
         """Main generator with crossfade logic"""
-        
-        # Get track duration for crossfade timing
         track_duration = self.instance.meta.duration_samples
         crossfade_start = max(0, track_duration - CROSSFADE_SAMPLES)
         
-        logger.info(f'CrossfadeStream: {self.instance.name} duration={track_duration} samples ({track_duration/SAMPLE_RATE:.1f}s), crossfade at {crossfade_start} ({crossfade_start/SAMPLE_RATE:.1f}s)')
+        logger.info(f'CrossfadeStream: {self.instance.name} duration={track_duration} samples, crossfade at {crossfade_start}')
         
-        # Start first decoder
         current_decoder = self._create_decoder()
         next_decoder = None
         
@@ -415,7 +418,6 @@ class CrossfadeRecordingStream:
         in_crossfade = False
         crossfade_position = 0
         
-        # Pre-generate crossfade curves (equal-power)
         fade_out = np.cos(np.linspace(0, np.pi/2, CROSSFADE_SAMPLES)).astype(np.float32)
         fade_in = np.sin(np.linspace(0, np.pi/2, CROSSFADE_SAMPLES)).astype(np.float32)
         
@@ -428,27 +430,31 @@ class CrossfadeRecordingStream:
                     chunk = next(current_decoder)
                     buffer = np.concatenate([buffer, chunk.flatten()])
                 except StopIteration:
-                    # Current track ended - should have transitioned already
-                    # Start fresh if we somehow got here
-                    logger.debug(f'CrossfadeStream: Track ended, starting fresh')
-                    logger.warning(f"EOF early: played={samples_played/SAMPLE_RATE:.2f}s "f"expected={track_duration/SAMPLE_RATE:.2f}s")
-                    if not in_crossfade:
+                    # FIX: The track ended early. Stop pulling from current_decoder immediately.
+                    logger.warning(f"CrossfadeStream: EOF early at {samples_played} samples")
+                    
+                    if next_decoder is None:
                         next_decoder = self._create_decoder()
-                        next_buffer = np.empty(0, dtype=np.float32)
-                        in_crossfade = True
-                        crossfade_position = 0
-                        continue
+                    
+                    # Immediately swap to the new track to prevent infinite loops and stuttering
+                    current_decoder = next_decoder
+                    buffer = np.concatenate([buffer, next_buffer])
+                    next_decoder = None
+                    next_buffer = np.empty(0, dtype=np.float32)
+                    in_crossfade = False
+                    crossfade_position = 0
+                    samples_played = 0 
+                    break # Break the inner while-loop so we can process what we have
             
             # Check if we should start crossfade
             if not in_crossfade and (samples_played >= crossfade_start or samples_played + len(buffer) >= crossfade_start):
-                logger.info(f'CrossfadeStream: Starting crossfade at sample {samples_played}')
                 in_crossfade = True
                 crossfade_position = 0
                 next_decoder = self._create_decoder()
                 next_buffer = np.empty(0, dtype=np.float32)
             
             # If in crossfade, also fill next_buffer
-            if in_crossfade:
+            if in_crossfade and next_decoder is not None:
                 while len(next_buffer) < self.CHUNK_SIZE * 2:
                     try:
                         chunk = next(next_decoder)
@@ -465,49 +471,37 @@ class CrossfadeRecordingStream:
                 next_chunk = next_buffer[:self.CHUNK_SIZE].copy()
                 next_buffer = next_buffer[self.CHUNK_SIZE:]
                 
-                # Calculate fade positions for this chunk
                 fade_start = crossfade_position
                 fade_end = min(crossfade_position + self.CHUNK_SIZE, CROSSFADE_SAMPLES)
                 chunk_fade_len = fade_end - fade_start
                 
                 if chunk_fade_len > 0 and fade_start < CROSSFADE_SAMPLES:
-                    # Apply fades
                     fade_out_chunk = fade_out[fade_start:fade_end]
                     fade_in_chunk = fade_in[fade_start:fade_end]
                     
-                    # Pad if needed
                     if len(fade_out_chunk) < self.CHUNK_SIZE:
                         fade_out_chunk = np.concatenate([fade_out_chunk, np.zeros(self.CHUNK_SIZE - len(fade_out_chunk), dtype=np.float32)])
                         fade_in_chunk = np.concatenate([fade_in_chunk, np.ones(self.CHUNK_SIZE - len(fade_in_chunk), dtype=np.float32)])
                     
-                    # Mix with crossfade
                     output_chunk = output_chunk[:len(fade_out_chunk)] * fade_out_chunk + next_chunk[:len(fade_in_chunk)] * fade_in_chunk
                 
                 crossfade_position += self.CHUNK_SIZE
                 
-                # Check if crossfade complete
                 if crossfade_position >= CROSSFADE_SAMPLES:
-                    logger.info(f'CrossfadeStream: Crossfade complete, switching to new track instance')
                     current_decoder = next_decoder
                     buffer = next_buffer
                     next_decoder = None
                     next_buffer = np.empty(0, dtype=np.float32)
-                    samples_played = crossfade_position  # We're this far into the new track
+                    samples_played = crossfade_position  
                     in_crossfade = False
                     crossfade_position = 0
             
-            # Convert to int16 and reshape for output
             output_chunk = np.clip(output_chunk, -32768, 32767).astype(np.int16)
             output_data = output_chunk.reshape(1, -1)
             
             samples_played += self.CHUNK_SIZE
             chunk_count += 1
             
-            if chunk_count % LOG_THRESHOLD == 0:
-                vol_mean = round(abs(output_chunk).mean())
-                status = "XFADE" if in_crossfade else "PLAY"
-                logger.info(f'CrossfadeStream [{status}]: chunk #{chunk_count}, samples={samples_played}, vol={vol_mean}')
-
             yield output_data
 
     def __iter__(self):
@@ -585,7 +579,11 @@ class SparsePlaybackStream:
             return int(final_interval * SAMPLE_RATE)
 
         def decode_file_once():
-            """Decode the entire file once, returning samples"""
+            """Decode the entire file once, returning samples. Caches the result to save CPU."""
+            # FIX: Check if we've already decoded this file
+            if hasattr(self.instance.meta, '_cached_audio') and self.instance.meta._cached_audio is not None:
+                return self.instance.meta._cached_audio
+
             resampler = av.AudioResampler(format='s16', layout='mono', rate=SAMPLE_RATE)
             container = av.open(self.instance.meta.path)
 
@@ -599,7 +597,6 @@ class SparsePlaybackStream:
             for frame_orig in container.decode(stream):
                 for frame_resamp in resampler.resample(frame_orig):
                     data = frame_resamp.to_ndarray()
-                    # Downmix to mono
                     data = data.mean(axis=0).astype(np.float32)
                     samples.append(data.flatten())
 
@@ -608,7 +605,10 @@ class SparsePlaybackStream:
             if not samples:
                 return np.zeros(0, dtype=np.float32)
 
-            return np.concatenate(samples)
+            final_audio = np.concatenate(samples)
+            # FIX: Cache the result for next time
+            self.instance.meta._cached_audio = final_audio
+            return final_audio
 
         def is_blocked_exclusive():
             """Check if this exclusive track is blocked (without claiming playback)."""
