@@ -1,6 +1,7 @@
 from enum import Enum
 import threading
 import time
+import queue
 import numpy as np
 
 from sonorium.obs import logger
@@ -266,6 +267,42 @@ class RecordingMetadata:
         return self.duration_seconds < threshold
 
 
+class BufferedAudioStream:
+    """
+    Wraps any synchronous audio stream with a background producer thread 
+    and a thread-safe queue to absorb CPU jitter and prevent audio gaps.
+    """
+    CHUNK_SIZE = 4096
+
+    def __init__(self, inner_stream, max_queue_size=16):
+        self.inner_stream = inner_stream
+        self.queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._producer_loop, daemon=True)
+        self._worker.start()
+
+    def _producer_loop(self):
+        try:
+            for chunk in self.inner_stream:
+                if self._stop_event.is_set():
+                    break
+                self.queue.put(chunk)
+        except Exception as e:
+            logger.error(f"BufferedAudioStream error in producer thread: {e}")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return self.queue.get(timeout=2.0)
+        except queue.Empty:
+            # Fallback silence chunk to avoid dropping audio output entirely during heavy stalls
+            fallback = np.zeros((1, self.CHUNK_SIZE), dtype=np.int16)
+            logger.warning("BufferedAudioStream queue starved, emitting safety silence chunk")
+            return fallback
+
+
 class RecordingThemeInstance:
     """
     Wraps the metadata, but with some extra state, to represent how that recording is set up within a given theme.
@@ -305,19 +342,22 @@ class RecordingThemeInstance:
 
         # SPARSE: Play once at full volume, then silence for interval
         if mode == PlaybackMode.SPARSE:
-            return SparsePlaybackStream(self, exclusion_coordinator)
-
-        # CONTINUOUS or PRESENCE: Start with base looping stream
-        if self.crossfade_enabled:
-            base_stream = CrossfadeRecordingStream(self)
+            stream = SparsePlaybackStream(self, exclusion_coordinator)
         else:
-            base_stream = RecordingThemeStream(self)
+            # CONTINUOUS or PRESENCE: Start with base looping stream
+            if self.crossfade_enabled:
+                base_stream = CrossfadeRecordingStream(self)
+            else:
+                base_stream = RecordingThemeStream(self)
 
-        # PRESENCE: Wrap with fade in/out based on presence value
-        if mode == PlaybackMode.PRESENCE and self.presence < 1.0:
-            return PresenceMixingStream(base_stream, self)
+            # PRESENCE: Wrap with fade in/out based on presence value
+            if mode == PlaybackMode.PRESENCE and self.presence < 1.0:
+                stream = PresenceMixingStream(base_stream, self)
+            else:
+                stream = base_stream
 
-        return base_stream
+        # Wrap the stream in a background buffered queue to decouple generation from consumption
+        return BufferedAudioStream(stream)
 
     @property
     def name(self):
@@ -383,7 +423,7 @@ class CrossfadeRecordingStream:
     """
     Recording stream with crossfade looping - seamlessly blends end of track into beginning using zero-copy in-place math arrays.
     """
-    CCHUNK_SIZE = 4096
+    CHUNK_SIZE = 4096
 
     def __init__(self, instance: RecordingThemeInstance):
         self.instance = instance
