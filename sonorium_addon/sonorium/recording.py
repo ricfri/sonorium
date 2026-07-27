@@ -269,14 +269,20 @@ class RecordingMetadata:
 
 class BufferedAudioStream:
     """
-    Wraps any synchronous audio stream with a background producer thread 
+    Wraps any synchronous audio stream with a background producer thread
     and a thread-safe queue to absorb CPU jitter and prevent audio gaps.
+
+    Many low-power Home Assistant devices reuse the same numpy buffer object
+    for streamed chunks, so we copy before enqueueing to avoid outdated
+    buffer contents being read by the consumer.
     """
     CHUNK_SIZE = 4096
+    DEFAULT_QUEUE_SIZE = 64
+    QUEUE_GET_TIMEOUT = 5.0
 
-    def __init__(self, inner_stream, max_queue_size=16):
+    def __init__(self, inner_stream, max_queue_size: int | None = None):
         self.inner_stream = inner_stream
-        self.queue = queue.Queue(maxsize=max_queue_size)
+        self.queue = queue.Queue(maxsize=max_queue_size or self.DEFAULT_QUEUE_SIZE)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(target=self._producer_loop, daemon=True)
         self._worker.start()
@@ -286,7 +292,7 @@ class BufferedAudioStream:
             for chunk in self.inner_stream:
                 if self._stop_event.is_set():
                     break
-                self.queue.put(chunk)
+                self.queue.put(chunk.copy())
         except Exception as e:
             logger.error(f"BufferedAudioStream error in producer thread: {e}")
 
@@ -295,7 +301,7 @@ class BufferedAudioStream:
 
     def __next__(self):
         try:
-            return self.queue.get(timeout=2.0)
+            return self.queue.get(timeout=self.QUEUE_GET_TIMEOUT)
         except queue.Empty:
             # Fallback silence chunk to avoid dropping audio output entirely during heavy stalls
             fallback = np.zeros((1, self.CHUNK_SIZE), dtype=np.int16)

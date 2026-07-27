@@ -6,7 +6,7 @@ import av
 import numpy as np
 
 from sonorium.obs import logger
-from sonorium.recording import LOG_THRESHOLD, ExclusionGroupCoordinator
+from sonorium.recording import LOG_THRESHOLD, ExclusionGroupCoordinator, RecordingThemeStream
 from sonorium.utils import IndexList
 
 
@@ -116,41 +116,37 @@ class ThemeStream:
 
     @cached_property
     def chunk_silence(self):
-        from sonorium.recording import RecordingThemeStream
         data = np.zeros((1, RecordingThemeStream.CHUNK_SIZE), np.int16)
         return data
 
     def iter_chunks(self):
+        chunk_size = RecordingThemeStream.CHUNK_SIZE
+        mix_buffer = np.empty(chunk_size, dtype=np.float32)
+        out_buffer = np.empty((1, chunk_size), dtype=np.int16)
 
         while True:
             data_recs = [next(streams) for streams in self.recording_streams if streams.instance.is_enabled]
             if not data_recs:
                 # logger.debug(f'Theme "{self.theme_def.name}" has no enabled recordings. Streaming silence...')
                 data_recs.append(self.chunk_silence)
-            
-            # Stack all recordings
-            data = np.vstack(data_recs)
-            
-            # Proper audio mixing: sum the signals, then normalize to prevent clipping
-            # Using float32 for intermediate calculation to avoid overflow
-            mixed = data.astype(np.float32).sum(axis=0)
-            
+
+            mix_buffer.fill(0.0)
+            for data in data_recs:
+                mix_buffer += data[0].astype(np.float32)
+
             # Soft clipping / normalization to prevent distortion
             # Divide by sqrt(n) for a good balance between volume and avoiding clipping
             n_tracks = len(data_recs)
             if n_tracks > 1:
-                # Use sqrt(n) normalization - louder than mean, but prevents harsh clipping
-                mixed = mixed / np.sqrt(n_tracks)
-            
+                mix_buffer /= np.sqrt(n_tracks)
+
             # Apply output gain boost (use device master_volume if available)
             output_gain = getattr(self.theme_def.sonorium, 'master_volume', DEFAULT_OUTPUT_GAIN)
-            mixed = mixed * output_gain
-            
-            # Clip to int16 range and convert back
-            mixed = np.clip(mixed, -32768, 32767)
-            data = mixed.astype(np.int16).reshape(1, -1)
-            
-            yield data
+            mix_buffer *= output_gain
+
+            np.clip(mix_buffer, -32768, 32767, out=mix_buffer)
+            out_buffer[0, :] = mix_buffer.astype(np.int16)
+            yield out_buffer
 
     def __iter__(self):
         output = av.open(file='.mp3', mode="w")
