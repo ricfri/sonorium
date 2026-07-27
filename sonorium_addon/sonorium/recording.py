@@ -327,19 +327,23 @@ class RecordingThemeInstance:
 class RecordingThemeStream:
     """
     Basic recording stream without crossfade - loops with hard cut from RAM cache.
+    Optimized with a pre-allocated output buffer for zero-copy yielding.
     """
     CHUNK_SIZE = 4096
 
     def __init__(self, instance: RecordingThemeInstance):
         self.instance = instance
+        # Pre-allocate the yield buffer once
+        self.out_buffer = np.empty((1, self.CHUNK_SIZE), dtype=np.int16)
         self.gen = self._gen()
 
     def _gen(self):
         audio_data = self.instance.meta.get_audio_data()
         
         if len(audio_data) == 0:
+            self.out_buffer.fill(0)
             while True:
-                yield np.zeros((1, self.CHUNK_SIZE), dtype=np.int16)
+                yield self.out_buffer
                 
         # Pre-apply volume and convert to int16 immediately
         audio_data = audio_data * self.instance.volume
@@ -353,14 +357,16 @@ class RecordingThemeStream:
             chunk_end = pos + self.CHUNK_SIZE
             
             if chunk_end <= total_samples:
-                chunk = audio_data[pos:chunk_end]
+                # Copy directly into the pre-allocated buffer
+                self.out_buffer[0, :] = audio_data[pos:chunk_end]
                 pos += self.CHUNK_SIZE
             else:
-                # Wrap around the array boundary
-                chunk = np.concatenate([audio_data[pos:], audio_data[:chunk_end - total_samples]])
+                rem = total_samples - pos
+                self.out_buffer[0, :rem] = audio_data[pos:]
+                self.out_buffer[0, rem:] = audio_data[:chunk_end - total_samples]
                 pos = chunk_end - total_samples
             
-            yield chunk.reshape(1, -1)
+            yield self.out_buffer
             
             if i % LOG_THRESHOLD == 0:
                 logger.debug(f'{self.__class__.__name__} Yielding chunk #{i}')
@@ -375,25 +381,30 @@ class RecordingThemeStream:
 
 class CrossfadeRecordingStream:
     """
-    Recording stream with crossfade looping - seamlessly blends end of track into beginning using RAM cache.
+    Recording stream with crossfade looping - seamlessly blends end of track into beginning using zero-copy in-place math arrays.
     """
-    CHUNK_SIZE = 4096
+    CCHUNK_SIZE = 4096
 
     def __init__(self, instance: RecordingThemeInstance):
         self.instance = instance
+        # Pre-allocate math buffers to avoid runtime garbage collection
+        self.mix_buffer = np.empty(self.CHUNK_SIZE, dtype=np.float32)
+        self.temp_buffer = np.empty(self.CHUNK_SIZE, dtype=np.float32)
+        self.out_buffer = np.empty((1, self.CHUNK_SIZE), dtype=np.int16)
         self.gen = self._gen()
 
     def _gen(self):
         audio_data = self.instance.meta.get_audio_data()
         
         if len(audio_data) == 0:
+            self.out_buffer.fill(0)
             while True:
-                yield np.zeros((1, self.CHUNK_SIZE), dtype=np.int16)
+                yield self.out_buffer
         
-        audio_data = audio_data * self.instance.volume
+        # Pre-apply volume to the float cache 
+        audio_data = (audio_data * self.instance.volume).astype(np.float32)
         track_duration = len(audio_data)
         
-        # Ensure we don't try to crossfade more samples than the track actually has
         actual_crossfade_samples = min(CROSSFADE_SAMPLES, track_duration // 2)
         crossfade_start = track_duration - actual_crossfade_samples
         
@@ -410,7 +421,7 @@ class CrossfadeRecordingStream:
             
             # Case 1: Entire chunk is before the crossfade
             if chunk_end <= crossfade_start:
-                output = audio_data[pos:chunk_end]
+                self.mix_buffer[:] = audio_data[pos:chunk_end]
                 pos += self.CHUNK_SIZE
                 
             # Case 2: Entire chunk is inside the crossfade
@@ -419,9 +430,10 @@ class CrossfadeRecordingStream:
                 fade_end_idx = fade_start_idx + self.CHUNK_SIZE
                 
                 if fade_end_idx <= actual_crossfade_samples:
-                    out_part = audio_data[pos:pos+self.CHUNK_SIZE] * fade_out[fade_start_idx:fade_end_idx]
-                    in_part = audio_data[fade_start_idx:fade_end_idx] * fade_in[fade_start_idx:fade_end_idx]
-                    output = out_part + in_part
+                    # In-place multiply and add
+                    np.multiply(audio_data[pos:pos+self.CHUNK_SIZE], fade_out[fade_start_idx:fade_end_idx], out=self.mix_buffer)
+                    np.multiply(audio_data[fade_start_idx:fade_end_idx], fade_in[fade_start_idx:fade_end_idx], out=self.temp_buffer)
+                    np.add(self.mix_buffer, self.temp_buffer, out=self.mix_buffer)
                     
                     pos += self.CHUNK_SIZE
                     if pos >= track_duration:
@@ -430,38 +442,37 @@ class CrossfadeRecordingStream:
                     # Chunk splits exactly across the end of the file
                     rem_samples = track_duration - pos
                     
-                    out_part = audio_data[pos:track_duration] * fade_out[fade_start_idx:actual_crossfade_samples]
-                    in_part = audio_data[fade_start_idx:actual_crossfade_samples] * fade_in[fade_start_idx:actual_crossfade_samples]
-                    first_half = out_part + in_part
+                    np.multiply(audio_data[pos:track_duration], fade_out[fade_start_idx:actual_crossfade_samples], out=self.temp_buffer[:rem_samples])
+                    np.multiply(audio_data[fade_start_idx:actual_crossfade_samples], fade_in[fade_start_idx:actual_crossfade_samples], out=self.mix_buffer[:rem_samples])
+                    np.add(self.temp_buffer[:rem_samples], self.mix_buffer[:rem_samples], out=self.mix_buffer[:rem_samples])
                     
                     pos = actual_crossfade_samples
                     remaining_chunk = self.CHUNK_SIZE - rem_samples
-                    second_half = audio_data[pos:pos+remaining_chunk]
+                    self.mix_buffer[rem_samples:] = audio_data[pos:pos+remaining_chunk]
                     pos += remaining_chunk
-                    
-                    output = np.concatenate([first_half, second_half])
                     
             # Case 3: Chunk starts normal, but ends inside the crossfade
             else:
                 normal_samples = crossfade_start - pos
                 fade_samples = self.CHUNK_SIZE - normal_samples
                 
-                first_half = audio_data[pos:crossfade_start]
+                self.mix_buffer[:normal_samples] = audio_data[pos:crossfade_start]
                 
-                out_part = audio_data[crossfade_start:crossfade_start+fade_samples] * fade_out[:fade_samples]
-                in_part = audio_data[:fade_samples] * fade_in[:fade_samples]
-                second_half = out_part + in_part
+                np.multiply(audio_data[crossfade_start:crossfade_start+fade_samples], fade_out[:fade_samples], out=self.temp_buffer[:fade_samples])
+                np.multiply(audio_data[:fade_samples], fade_in[:fade_samples], out=self.mix_buffer[normal_samples:])
+                np.add(self.temp_buffer[:fade_samples], self.mix_buffer[normal_samples:], out=self.mix_buffer[normal_samples:])
                 
-                output = np.concatenate([first_half, second_half])
                 pos += self.CHUNK_SIZE
 
-            output_data = np.clip(output, -32768, 32767).astype(np.int16).reshape(1, -1)
+            # In-place clipping and integer casting
+            np.clip(self.mix_buffer, -32768, 32767, out=self.mix_buffer)
+            self.out_buffer[0, :] = self.mix_buffer
             
             chunk_count += 1
             if chunk_count % LOG_THRESHOLD == 0:
                 logger.debug(f'CrossfadeStream: chunk #{chunk_count}, samples={pos}')
                 
-            yield output_data
+            yield self.out_buffer
 
     def __iter__(self):
         return self
@@ -489,10 +500,13 @@ class SparsePlaybackStream:
     """
     CHUNK_SIZE = 4096
 
-    def __init__(self, instance: RecordingThemeInstance, exclusion_coordinator: ExclusionGroupCoordinator = None):
+    def __init__(self, instance: RecordingThemeInstance, exclusion_coordinator=None):
         self.instance = instance
         self.exclusion_coordinator = exclusion_coordinator
-
+        # Pre-allocate math buffers
+        self.mix_buffer = np.empty(self.CHUNK_SIZE, dtype=np.float32)
+        self.out_buffer = np.empty((1, self.CHUNK_SIZE), dtype=np.int16)
+        
         if self.instance.exclusive and self.exclusion_coordinator is not None:
             self.exclusion_coordinator.register_track(self.instance.name)
 
@@ -504,8 +518,7 @@ class SparsePlaybackStream:
         presence = self.instance.presence
         file_duration_seconds = self.instance.meta.duration_seconds
 
-        logger.info(f'SparsePlaybackStream: {self.instance.name} - short file ({file_duration_seconds:.1f}s), using sparse playback' +
-                    (', exclusive=True' if self.instance.exclusive else ''))
+        logger.info(f'SparsePlaybackStream: {self.instance.name} - short file ({file_duration_seconds:.1f}s)')
 
         fade_duration = min(TRACK_FADE_DURATION, file_duration_seconds / 3)
         fade_samples = int(fade_duration * SAMPLE_RATE)
@@ -521,13 +534,11 @@ class SparsePlaybackStream:
             return int(final_interval * SAMPLE_RATE)
 
         def is_blocked_exclusive():
-            if not self.instance.exclusive or self.exclusion_coordinator is None:
-                return False
+            if not self.instance.exclusive or self.exclusion_coordinator is None: return False
             return self.exclusion_coordinator.is_blocked(self.instance.name)
 
         def try_start_exclusive():
-            if not self.instance.exclusive or self.exclusion_coordinator is None:
-                return True
+            if not self.instance.exclusive or self.exclusion_coordinator is None: return True
             return self.exclusion_coordinator.try_start_playing(self.instance.name, file_duration_seconds)
 
         def finish_exclusive():
@@ -558,43 +569,48 @@ class SparsePlaybackStream:
                         chunk_count += 1
                         yield silence_chunk
 
-            if is_blocked_exclusive():
+            if is_blocked_exclusive() or not try_start_exclusive():
                 wait_chunks = get_block_wait_chunks()
                 for _ in range(wait_chunks):
                     chunk_count += 1
                     yield silence_chunk
                 continue
 
-            if not try_start_exclusive():
-                wait_chunks = get_block_wait_chunks()
-                for _ in range(wait_chunks):
-                    chunk_count += 1
-                    yield silence_chunk
-                continue
-
-            # Fetch the decoded audio from the RAM cache
-            audio_data = self.instance.meta.get_audio_data().copy()
+            # Instead of copying the whole array, reference it dynamically
+            audio_data = self.instance.meta.get_audio_data()
 
             if len(audio_data) > 0:
-                audio_data = audio_data * self.instance.volume
-
-                if len(fade_in_curve) <= len(audio_data):
-                    audio_data[:len(fade_in_curve)] *= fade_in_curve
-
-                if len(fade_out_curve) <= len(audio_data):
-                    audio_data[-len(fade_out_curve):] *= fade_out_curve
-
                 pos = 0
                 while pos < len(audio_data):
                     chunk_end = min(pos + self.CHUNK_SIZE, len(audio_data))
-                    chunk = audio_data[pos:chunk_end]
+                    chunk_len = chunk_end - pos
 
-                    if len(chunk) < self.CHUNK_SIZE:
-                        chunk = np.concatenate([chunk, np.zeros(self.CHUNK_SIZE - len(chunk), dtype=np.float32)])
+                    # Pull in chunk and apply volume dynamically
+                    np.multiply(audio_data[pos:chunk_end], self.instance.volume, out=self.mix_buffer[:chunk_len])
 
-                    output = np.clip(chunk, -32768, 32767).astype(np.int16).reshape(1, -1)
+                    # In-place fade-in
+                    if pos < fade_samples:
+                        fade_end = min(chunk_len, fade_samples - pos)
+                        np.multiply(self.mix_buffer[:fade_end], fade_in_curve[pos:pos+fade_end], out=self.mix_buffer[:fade_end])
+
+                    # In-place fade-out
+                    fade_out_start_pos = len(audio_data) - fade_samples
+                    if chunk_end > fade_out_start_pos:
+                        buf_start = max(0, fade_out_start_pos - pos)
+                        curve_start = pos + buf_start - fade_out_start_pos
+                        overlap_len = chunk_len - buf_start
+                        np.multiply(self.mix_buffer[buf_start:chunk_len], fade_out_curve[curve_start:curve_start+overlap_len], out=self.mix_buffer[buf_start:chunk_len])
+
+                    # Pad end if chunk is smaller than CHUNK_SIZE
+                    if chunk_len < self.CHUNK_SIZE:
+                        self.mix_buffer[chunk_len:].fill(0)
+
+                    # In-place clip and assign
+                    np.clip(self.mix_buffer, -32768, 32767, out=self.mix_buffer)
+                    self.out_buffer[0, :] = self.mix_buffer
+                    
                     chunk_count += 1
-                    yield output
+                    yield self.out_buffer
                     pos += self.CHUNK_SIZE
 
             finish_exclusive()
@@ -630,6 +646,9 @@ class PresenceMixingStream:
     def __init__(self, base_stream, instance: RecordingThemeInstance):
         self.base_stream = base_stream
         self.instance = instance
+        # Pre-allocate math buffers
+        self.float_buffer = np.empty((1, self.CHUNK_SIZE), dtype=np.float32)
+        self.out_buffer = np.empty((1, self.CHUNK_SIZE), dtype=np.int16)
         self.gen = self._gen()
 
     def _gen(self):
@@ -713,17 +732,22 @@ class PresenceMixingStream:
             else:
                 applied_gain = current_gain
 
-            # Apply gain efficiently
+            # Perform high-performance bypass or zero-copy math
             if applied_gain == 1.0:
-                pass  # Skip heavy math, yield as is
+                yield chunk  
             elif applied_gain == 0.0:
-                chunk = np.zeros_like(chunk)  # Instant silence
+                self.out_buffer.fill(0)
+                yield self.out_buffer
             else:
-                chunk_float = chunk.astype(np.float32) * applied_gain
-                chunk = np.clip(chunk_float, -32768, 32767).astype(np.int16)
+                # Copy into float buffer, multiply, clip, and recast—all in-place without creating new arrays
+                np.copyto(self.float_buffer, chunk)
+                np.multiply(self.float_buffer, applied_gain, out=self.float_buffer)
+                np.clip(self.float_buffer, -32768, 32767, out=self.float_buffer)
+                
+                self.out_buffer[:] = self.float_buffer
+                yield self.out_buffer
 
             chunk_count += 1
-            yield chunk
 
     def __iter__(self):
         return self
